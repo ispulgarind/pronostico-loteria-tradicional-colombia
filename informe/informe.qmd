@@ -1,0 +1,1384 @@
+---
+title: "Proyecto-final"
+format: html
+editor: visual
+---
+
+# Preparación del entorno
+
+```{r}
+#Cargar las librerias
+library(dplyr)
+library(lubridate)
+library(tidyverse)
+library(stringi)
+library(forecast)
+library(patchwork)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(tsibble)
+library(tibble)
+library(tsibble)
+library(fable)
+library(fabletools)
+library(feasts)
+```
+
+
+```{r}
+# Cargar funciones
+source("00-lectura.R")
+source("01-graficos.R")
+source("02-interpolacion.R")
+source("03-transformacion.R")
+source("04-diferenciacion.R")
+```
+
+# Lectura y preparación de los datos
+
+```{r}
+#Cargar la base
+datos <- read.csv("Ventas_del_Juego_de_Lotería_Tradicional_20261015.csv",
+                  header = TRUE,
+                  sep = ",")
+```
+
+```{r}
+head(datos)      # Primeras 6 filas
+View(datos)      # Abrir tabla
+str(datos)       # Estructura de los datos
+```
+
+## Limpieza
+
+### Revisión de digitación
+
+```{r}
+# BLOQUE 1. Toma las 4 primeras columnas de `datos`, arregla el año (2020 se leía como 202),
+# y deja el nombre de la lotería en minúscula y sin tildes.
+d <- datos |>
+  as_tibble() |>
+  select(1:4) |>
+  set_names(c("anio", "mes", "loteria_orig", "ventas_txt")) |>
+  mutate(
+    anio = as.integer(str_remove_all(as.character(anio), "[.,]")),
+    anio = if_else(anio == 202L, 2020L, anio),
+    mes = as.integer(mes),
+    ventas_txt = str_trim(as.character(ventas_txt)),
+    loteria = loteria_orig |> stringi::stri_trans_general("Latin-ASCII") |> str_to_lower() |> str_squish()
+  )
+
+d |> count(anio) |> print(n = Inf)
+```
+
+```{r}
+# BLOQUE 2. Pasa las ventas de texto a número. Solo hay un formato (comas de miles),
+# así que basta quitar "$", comas y espacios. El guion "-" queda como NA (mes sin sorteo).
+d <- d |>
+  mutate(ventas = suppressWarnings(as.numeric(str_remove_all(ventas_txt, "[$,\\s]"))))
+
+d |> filter(is.na(ventas), !ventas_txt %in% c("-", "")) |> distinct(ventas_txt) 
+```
+
+```{r}
+# BLOQUE 3. Unifica los nombres que se escriben distinto entre años y deja solo las
+# 14 loterías ordinarias. Los sorteos extraordinarios se excluyen de la serie principal.
+d <- d |> mutate(loteria = case_when(
+  str_detect(loteria, "cundinamarca") ~ "loteria de cundinamarca",
+  str_detect(loteria, "manizales")    ~ "loteria de manizales",
+  str_detect(loteria, "valle")        ~ "loteria del valle",
+  str_detect(loteria, "cruz roja")    ~ "loteria de la cruz roja",
+  str_detect(loteria, "santander")    ~ "loteria de santander",
+  TRUE ~ loteria))
+
+d <- d |> filter(!str_detect(loteria, "sorteo|extra|consorcio|union"))
+
+n_distinct(d$loteria)   # debe dar 14
+```
+
+```{r}
+# BLOQUE 4. Aplica las correcciones ya decididas. Cada una va a la tabla de depuración.
+# Se corre UNA sola vez sobre una `d` recién creada (bloques 1 a 3).
+
+# 4a. Enero de 2012: la fila de 1.593 millones puesta como Medellín es de Cauca.
+fila_cauca <- which(d$anio == 2012 & d$mes == 1 & d$loteria == "loteria de medellin" & d$ventas < 2e9)
+if (length(fila_cauca) == 1) d$loteria[fila_cauca] <- "loteria del cauca"
+
+d |> filter(anio == 2012, mes == 1, loteria %in% c("loteria del cauca", "loteria de medellin")) |>
+  select(loteria, ventas)   # deben salir Cauca (1.593 millones) y Medellín (5.994 millones)
+
+# 4b. Cuatro valores con tres ceros de más (Cundinamarca 2017 x2 y 2019, Santander mar-2020):
+# se dividen entre 1000. La mediana de cada lotería se calcula sin julio de 2025.
+# Se puede repetir sin riesgo: si ya están corregidos, no detecta ninguno y no cambia nada.
+d <- d |>
+  group_by(loteria) |>
+  mutate(mediana = median(ventas[!(anio == 2025 & mes == 7)], na.rm = TRUE),
+         tres_ceros = !is.na(ventas) & ventas / mediana > 100) |>
+  ungroup()
+
+sum(d$tres_ceros)   # 4 la primera vez; 0 si ya estaban corregidos
+
+d <- d |> mutate(ventas = if_else(tres_ceros, ventas / 1000, ventas)) |>
+  select(-mediana, -tres_ceros)
+```
+
+### Unificación del mes de julio de 2025
+
+```{r}
+# BLOQUE 5. Deja una fila por año, mes y lotería. Julio de 2025 trae ~33 filas por lotería
+# y se suman; en los demás meses ya había una sola fila.
+mensual <- d |>
+  group_by(anio, mes, loteria) |>
+  summarise(ventas = if (all(is.na(ventas))) NA_real_ else sum(ventas, na.rm = TRUE),
+            .groups = "drop")
+
+d |> count(anio, mes, loteria) |> filter(n > 1, !(anio == 2025 & mes == 7))  # debe salir vacío
+max(mensual$ventas, na.rm = TRUE)    # debe ser menor de 3e10 (30.000 millones)
+```
+
+## Preparación Total Nacional
+
+```{r}
+# BLOQUE 6. Suma las 14 loterías por mes, en millones de pesos corrientes.
+# Abril de 2020 (sin sorteos) queda como NA y no como cero. `incompleto` marca los meses
+# con menos de 14 loterías (se espera mayo y junio de 2026, sin el Quindío).
+fechas <- tibble(fecha = seq(ymd("2012-01-01"), ymd("2026-06-01"), by = "month")) |>
+  mutate(anio = year(fecha), mes = month(fecha))
+
+nacional <- mensual |>
+  group_by(anio, mes) |>
+  summarise(total = sum(ventas, na.rm = TRUE),
+            n_loterias = sum(!is.na(ventas) & ventas > 0), .groups = "drop") |>
+  right_join(fechas, by = c("anio", "mes")) |>
+  arrange(fecha) |>
+  mutate(faltante = is.na(total) | total == 0,
+         incompleto = !faltante & n_loterias < 14,
+         ventas_mill = if_else(faltante, NA_real_, total / 1e6))
+
+nrow(nacional)                 # debe dar 174
+filter(nacional, faltante)     # debe salir solo abril de 2020
+filter(nacional, incompleto)   # debe salir mayo y junio de 2026
+```
+
+## Datos finales
+
+```{r}
+# BLOQUE 7. Guarda la serie y la tabla de decisiones (producto del objetivo 1).
+# Completen la columna "razon" con la evidencia que consulten.
+bitacora <- tribble(
+  ~hallazgo, ~donde, ~decision, ~razon,
+  "Formato numérico", "toda la base", "Un solo formato; conversión directa", "Verificado por año: todos con comas de miles",
+  "Nombres con escritura distinta", "34 nombres -> 14 loterías", "Unificados", "[completar]",
+  "Sorteos extraordinarios", "6 nombres", "Excluidos de la serie principal; sensibilidad", "Calendario irregular y operadores cambiantes; pesan 2,9 % a 8,1 % de las ventas anuales",
+  "Fila de Medellín con 1.593 millones", "enero de 2012", "Reasignada a Cauca", "Magnitud coherente con Cauca (1.185 a 2.042 millones) y no con Medellín (5.426 a 7.439)",
+  "Valores con tres ceros de más", "Cundinamarca 2017 (x2) y 2019; Santander mar-2020", "Se dividen entre 1000", "Quedan en la escala de los meses vecinos; no confirmado con la fuente",
+  "Julio de 2025 con ~33 filas por lotería", "julio de 2025", "Se suman las filas", "[completar: evidencia del calendario y sensibilidad excluyéndolo]",
+  "Sin sorteos por el aislamiento", "abril de 2020", "NA en la serie e intervención en el modelo", "Cero estructural; con cero no se toma logaritmo",
+  "Quindío sin datos", "mayo y junio de 2026", "Se mantienen 174 meses con 13 loterías", "Pesa 2,5 % del total; posible rezago; sensibilidad terminando en abril de 2026"
+)
+
+write_csv(nacional, "serie_nacional_mensual.csv")
+write_csv(mensual, "ventas_por_loteria_mes.csv")
+write_csv(bitacora, "tabla_depuracion.csv")
+```
+
+# Participación de cada loteria
+
+```{r}
+# BLOQUE 8. Mide si la participación de cada lotería es estable (corrección 2 del H2).
+# Usa solo años completos y sin meses faltantes (2020 y 2026 quedan fuera solos).
+# El umbral se fija ANTES de ver el resultado.
+umbral <- 0.10
+
+anios_ok <- nacional |> group_by(anio) |>
+  summarise(ok = n() == 12 & all(!faltante)) |>
+  filter(ok) |> pull(anio)
+anios_ok
+
+part <- mensual |>
+  filter(anio %in% anios_ok) |>
+  group_by(anio, loteria) |>
+  summarise(ventas = sum(ventas, na.rm = TRUE), .groups = "drop") |>
+  group_by(anio) |>
+  mutate(part = ventas / sum(ventas)) |>
+  ungroup()
+
+resumen <- part |>
+  group_by(loteria) |>
+  summarise(media = mean(part), cv = sd(part) / mean(part)) |>
+  arrange(desc(media)) |>
+  mutate(acum = cumsum(media) / sum(media))
+
+principales <- resumen |> filter(lag(acum, default = 0) < 0.80) |> pull(loteria)
+resumen |> filter(loteria %in% principales)
+
+# Error de usar la participación del año anterior
+part |>
+  filter(loteria %in% principales) |>
+  arrange(loteria, anio) |>
+  group_by(loteria) |>
+  mutate(prev = lag(part), consecutivo = anio - lag(anio) == 1, ape = abs(part - prev) / part) |>
+  ungroup() |>
+  filter(consecutivo) |>
+  group_by(loteria) |>
+  summarise(mape = mean(ape)) |>
+  arrange(desc(mape))
+```
+
+## Verificación de los meses
+
+```{r}
+# D1. Meses con menos de 14 loterías (esperado: solo mayo y junio de 2026 tras el bloque 4a)
+mensual |> filter(!is.na(ventas), ventas > 0) |>
+  group_by(anio, mes) |> summarise(n = n_distinct(loteria), .groups = "drop") |>
+  filter(n < 14)
+
+# D2. Peso de cada lotería en 2025, sin julio
+mensual |> filter(anio == 2025, mes != 7) |>
+  group_by(loteria) |> summarise(total = sum(ventas, na.rm = TRUE)) |>
+  mutate(pct = round(100 * total / sum(total), 1)) |> arrange(pct)
+
+# D3. Julio de 2025 frente a sus meses vecinos, comparado con la variación normal
+v <- nacional$ventas_mill
+nacional$razon_vecinos <- v / ((lag(v) + lead(v)) / 2)
+nacional |> filter(anio %in% 2013:2024, anio != 2020) |>
+  summarise(p05 = quantile(razon_vecinos, 0.05, na.rm = TRUE),
+            p95 = quantile(razon_vecinos, 0.95, na.rm = TRUE))
+nacional |> filter(anio == 2025, mes == 7) |> select(anio, mes, razon_vecinos)
+```
+
+```{r}
+nacional |> filter(mes == 7, anio %in% 2013:2024, anio != 2020) |> select(anio, razon_vecinos)
+```
+
+```{r}
+
+# Crear una copia de la base de datos original
+base_copia <- read.csv("serie_nacional_mensual.csv",
+                  header = TRUE,
+                  sep = ",")
+
+# Conservar únicamente las columnas necesarias
+base_copia <- base_copia %>%
+  select(anio, mes, total, ventas_mill)
+
+# Guardar la nueva base de datos como CSV
+write.csv(base_copia, "base_filtrada.csv", row.names = FALSE)
+```
+
+```{r}
+# Contar cuántos registros hay por lotería
+
+# Cargar la base de datos
+ventas_por_loteria_mes <- read.csv(
+  "ventas_por_loteria_mes.csv",
+  stringsAsFactors = FALSE
+)
+
+# Verificar que se haya cargado correctamente
+class(ventas_por_loteria_mes)
+
+# Contar registros por lotería
+registros_por_loteria <- as.data.frame(
+  table(ventas_por_loteria_mes$loteria)
+)
+
+names(registros_por_loteria) <- c("loteria", "cantidad_registros")
+
+print(registros_por_loteria)
+```
+
+# Análisis descriptivo
+
+```{r}
+# Copiar la base original
+venta_loteria_mes <- read.csv("ventas_por_loteria_mes.csv")
+datos <- venta_loteria_mes
+
+# Convertir ventas a millones de pesos
+datos$ventas <- datos$ventas / 1000000
+
+# Crear variable de fecha
+datos$fecha <- as.Date(
+  paste(datos$anio, datos$mes, "01", sep = "-")
+)
+
+# Ordenar los datos
+datos <- datos[order(datos$loteria, datos$fecha), ]
+
+# Consultar las loterías
+unique(datos$loteria)
+```
+
+```{r}
+# Separar las loterías
+loterias <- unique(datos$loteria)
+
+# Crear tabla vacía
+tabla_descriptiva <- data.frame()
+
+# Calcular estadísticos
+for (l in loterias) {
+
+  x <- datos$ventas[datos$loteria == l]
+
+  fila <- data.frame(
+    Loteria = l,
+    Media = mean(x, na.rm = TRUE),
+    Mediana = median(x, na.rm = TRUE),
+    Desviacion = sd(x, na.rm = TRUE),
+    Minimo = min(x, na.rm = TRUE),
+    Q1 = as.numeric(quantile(x, 0.25, na.rm = TRUE)),
+    Q3 = as.numeric(quantile(x, 0.75, na.rm = TRUE)),
+    Maximo = max(x, na.rm = TRUE),
+    CV = sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE) * 100
+  )
+
+  tabla_descriptiva <- rbind(tabla_descriptiva, fila)
+}
+
+# Mostrar tabla
+rownames(tabla_descriptiva) <- NULL
+tabla_descriptiva
+```
+
+```{r}
+# Calcular ventas nacionales por mes
+nacional <- aggregate(
+  ventas ~ anio + mes + fecha,
+  data = datos,
+  FUN = sum
+)
+
+# Unir las ventas nacionales con las individuales
+datos <- merge(
+  datos,
+  nacional[, c("anio", "mes", "ventas")],
+  by = c("anio", "mes"),
+  suffixes = c("_loteria", "_nacional")
+)
+
+# Calcular participación mensual
+datos$participacion <- (
+  datos$ventas_loteria / datos$ventas_nacional
+) * 100
+```
+
+```{r}
+# Participación promedio y variabilidad
+tabla_participacion <- aggregate(
+  participacion ~ loteria,
+  data = datos,
+  FUN = function(x) c(
+    Media = mean(x),
+    Mediana = median(x),
+    Desviacion = sd(x),
+    Minimo = min(x),
+    Maximo = max(x),
+    CV = sd(x) / mean(x) * 100
+  )
+)
+
+# Organizar tabla
+tabla_participacion_final <- data.frame(
+  Loteria = tabla_participacion$loteria,
+  tabla_participacion$participacion
+)
+
+tabla_participacion_final
+```
+
+```{r}
+# Calcular la participación
+participacion <- ventas_por_loteria_mes %>%
+  group_by(loteria) %>%
+  summarise(
+    Ventas_totales = sum(ventas, na.rm = TRUE)
+  ) %>%
+  mutate(
+    Participacion = Ventas_totales / sum(Ventas_totales) * 100
+  ) %>%
+  arrange(desc(Participacion))
+
+# Mostrar resultados
+participacion
+```
+
+```{r}
+# Gráfico de barras
+ggplot(participacion,
+       aes(x = reorder(loteria, Participacion),
+           y = Participacion)) +
+  geom_col(fill = "purple") +
+  geom_text(aes(label = round(Participacion, 1)),
+            hjust = -0.2, size = 3.5) +
+  coord_flip() +
+  labs(
+    title = "Participación de las loterías en las ventas nacionales",
+    x = "Lotería",
+    y = "Participación (%)"
+  ) +
+  theme_minimal() +
+  expand_limits(y = max(participacion$Participacion) * 1.12)
+```
+
+```{r}
+# Cargar la base nacional
+nacional <- read.csv("base_filtrada.csv")
+
+# Extraer la variable de ventas
+x <- nacional$ventas_mill
+
+# Calcular estadísticos descriptivos
+tabla_descriptiva <- data.frame(
+  Media = mean(x, na.rm = TRUE),
+  Mediana = median(x, na.rm = TRUE),
+  Desviacion = sd(x, na.rm = TRUE),
+  Minimo = min(x, na.rm = TRUE),
+  Q1 = as.numeric(quantile(x, 0.25, na.rm = TRUE)),
+  Q3 = as.numeric(quantile(x, 0.75, na.rm = TRUE)),
+  Maximo = max(x, na.rm = TRUE),
+  CV = sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE) * 100
+)
+
+# Mostrar tabla
+tabla_descriptiva
+```
+
+## Relación entre ventas y números de sorteos
+
+```{r}
+# Cargar las bases
+lot <- read_csv("ventas_por_loteria_mes.csv", show_col_types = FALSE)  # anio, mes, loteria, ventas
+nac <- read_csv("base_filtrada.csv", show_col_types = FALSE)           # anio, mes, total, ventas_mill
+nrow(nac)   # debe dar 174
+```
+
+```{r}
+# Construir el numero de sorteos
+dias_sorteo <- tribble(
+  ~loteria,                  ~dia,
+  "loteria de bogota",        4,   # jueves
+  "loteria de boyaca",        6,   # sábado
+  "loteria de cundinamarca",  1,   # lunes
+  "loteria de la cruz roja",  2,   # martes
+  "loteria de manizales",     3,   # miércoles
+  "loteria de medellin",      5,   # viernes
+  "loteria de santander",     5,   # viernes
+  "loteria del cauca",        6,   # sábado
+  "loteria del huila",        2,   # martes
+  "loteria del meta",         3,   # miércoles
+  "loteria del quindio",      4,   # jueves
+  "loteria del risaralda",    5,   # viernes
+  "loteria del tolima",       1,   # lunes
+  "loteria del valle",        3    # miércoles
+)
+stopifnot(!anyNA(dias_sorteo$dia))
+
+dias_sorteo |> count(dia)   # esperado: lunes 2, martes 2, miércoles 3, jueves 2, viernes 3, sábado 2
+
+n_dia <- function(anio, mes, dia) {
+  f1 <- make_date(anio, mes, 1)
+  f  <- seq(f1, by = "day", length.out = days_in_month(f1))
+  sum(wday(f, week_start = 1) == dia)
+}
+
+serie <- nac |>
+  rowwise() |>
+  mutate(n_sorteos = sum(map_dbl(dias_sorteo$dia, ~ n_dia(anio, mes, .x)))) |>
+  ungroup() |>
+  mutate(mes_ts = yearmonth(make_date(anio, mes, 1)),
+         n_prom = n_sorteos / nrow(dias_sorteo)) |>   # sorteos por lotería, en promedio
+  as_tsibble(index = mes_ts)
+
+summary(serie$n_sorteos)
+```
+
+## Muestra para la prueba
+
+```{r}
+
+lambda <- 0   # λ elegido con Guerrero
+
+datos_t <- serie |>
+  mutate(
+    afectado = mes_ts >= yearmonth("2020-03") &
+               mes_ts <= yearmonth("2020-12"),
+    y_pos = if_else(
+      ventas_mill > 0 & !afectado,
+      ventas_mill,
+      NA_real_
+    ),
+    w = BoxCox(y_pos, lambda)
+  )
+```
+
+```{r}
+# Modelo sin la covariable y ordenes
+sin <- datos_t |> model(sin = ARIMA(w ~ pdq() + PDQ()))
+report(sin)    # anoten los órdenes: ARIMA(p,d,q)(P,D,Q)[12]
+
+o  <- c(1, 0, 2)
+so <- c(2, 1, 0)  # ESCRIBIR (P, D, Q)
+
+ajustes <- datos_t |> model(
+  sin = ARIMA(w ~ pdq(o[1], o[2], o[3]) + PDQ(so[1], so[2], so[3])),
+  con = ARIMA(w ~ n_sorteos + pdq(o[1], o[2], o[3]) + PDQ(so[1], so[2], so[3]))
+)
+```
+
+```{r}
+# significancia y tamaño del efecto
+# Estadístico del coeficiente
+tidy(ajustes) |> filter(.model == "con", term == "n_prom")
+
+# Razón de verosimilitud (1 grado de libertad)
+g   <- glance(ajustes)
+ll0 <- g$log_lik[g$.model == "sin"]
+ll1 <- g$log_lik[g$.model == "con"]
+LR  <- 2 * (ll1 - ll0)
+c(LR = LR, p = pchisq(LR, df = 1, lower.tail = FALSE))
+
+g |> select(.model, log_lik, AICc, sigma2)
+
+# Efecto en porcentaje (válido si λ = 0): mes con 5 sorteos por lotería frente a uno con 4
+b  <- tidy(ajustes) |> filter(.model == "con", term == "n_prom")
+100 * (exp(c(estimado = b$estimate,
+             inferior = b$estimate - 1.96 * b$std.error,
+             superior = b$estimate + 1.96 * b$std.error)) - 1)
+
+tidy(ajustes) |>
+  filter(.model == "con", term == "n_sorteos")
+```
+
+## Ventas mensuales nacionales por periodo
+
+```{r}
+base <- read.csv("base_filtrada_ajustada.csv")          # anio, mes, total, ventas_mill
+base$periodo <- cut(base$anio, c(2011, 2019, 2020, 2026),
+                    labels = c("2012-2019", "2020", "2021-2026"))
+```
+
+```{r}
+nac$periodo <- cut(base$anio, c(2011, 2019, 2020, 2026),
+                    labels = c("2012-2019", "2020", "2021-2026"))
+
+# 1. Descriptivos por periodo
+desc <- do.call(rbind, lapply(split(base$ventas_mill, base$periodo), function(x)
+  data.frame(n = length(x), media = mean(x), mediana = median(x),
+             sd = sd(x), min = min(x), max = max(x))))
+knitr::kable(desc, digits = 0)
+
+# 2. Boxplot (con los puntos, para que se vean los 12 meses de 2020)
+g <- ggplot(base, aes(periodo, ventas_mill)) +
+  geom_boxplot(fill = "purple", alpha = 0.3, outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 1, color = "purple") +
+  labs(x = "Periodo", y = "Ventas mensuales (millones de pesos corrientes)",
+       title = "Ventas nacionales por periodo") +
+  theme_minimal()
+
+
+ggsave("boxplot_periodos.png", g, width = 6, height = 4.5, dpi = 300)
+```
+
+### Comparaciones por pares de las ventas mensuales entre periodos
+
+```{r}
+# Kruskal-Wallis y tamaño del efecto
+kw <- kruskal.test(ventas_mill ~ periodo, data = base)
+kw
+epsilon2 <- unname(kw$statistic) / (nrow(base) - 1)   
+epsilon2
+
+# Comparaciones por pares (Wilcoxon con corrección de Holm)
+pairwise.wilcox.test(base$ventas_mill, base$periodo,
+                     p.adjust.method = "holm", exact = FALSE)
+```
+
+:::::: panel-tabset
+# Imputación de marzo a agosto de 2020
+
+::: panel-tabset
+## Serie Nacional
+
+```{r}
+base_filtrada <- read.csv("base_filtrada.csv")
+
+base_filtrada <- imputar_2020(base_filtrada, "total")
+base_filtrada <- imputar_2020(base_filtrada, "ventas_mill")
+
+# Ya no hay ceros, así que NO se suma ninguna constante.
+# Box-Cox exige valores estrictamente positivos:
+stopifnot(all(base_filtrada$total > 0),
+          all(base_filtrada$ventas_mill > 0))
+
+write.csv(base_filtrada, "base_filtrada_ajustada.csv", row.names = FALSE)
+```
+
+## 14 Loterías
+
+```{r}
+ventas_por_loteria_mes <- read.csv("ventas_por_loteria_mes.csv")
+
+# Cuántos ceros o NA hay por lotería ANTES de imputar (debería ser solo abril 2020)
+print(aggregate(ventas ~ loteria, data = ventas_por_loteria_mes,
+                FUN = function(v) sum(v == 0 | is.na(v))))
+
+ventas_por_loteria_mes <- do.call(
+  rbind,
+  lapply(split(ventas_por_loteria_mes, ventas_por_loteria_mes$loteria),
+         imputar_2020, col = "ventas")
+)
+
+stopifnot(all(ventas_por_loteria_mes$ventas > 0))
+
+dir.create("Loterias_ajustadas", showWarnings = FALSE)
+
+for (l in unique(ventas_por_loteria_mes$loteria)) {
+  write.csv(
+    subset(ventas_por_loteria_mes, loteria == l),
+    paste0("Loterias_ajustadas/", gsub(" ", "_", l), ".csv"),
+    row.names = FALSE
+  )
+}
+```
+:::
+
+# Paso 1: Graficar las series, ACF y PACF
+
+::: panel-tabset
+## Serie Nacional
+
+```{r}
+# Leer serie
+serie_nacional <- leer_serie(
+  "base_filtrada_ajustada.csv",
+  fuente = "Ventas mensuales de lotería",
+  unidad = "millones de pesos"
+)
+
+# Graficar serie
+grafico_nal <- graficar_serie(
+  serie_nacional,
+  "Ventas mensuales de lotería"
+)
+
+# Calcular ACF y PACF
+resultado_cor_nal <- graficar_correlaciones(
+  serie_nacional$y,
+  m = 24
+)
+
+# Panel de diagnóstico
+panel_nal <- panel_diagnostico(
+  grafico_nal,
+  resultado_cor_nal
+)
+
+panel_nal
+```
+
+La serie de ventas mensuales de lotería presenta una clara tendencia a lo largo del tiempo, con un crecimiento más pronunciado y acelerado a partir de 2021. Asimismo, se observa una fuerte estacionalidad caracterizada por picos anuales recurrentes y muy elevados hacia el cierre de cada periodo. En cuanto a la estacionariedad, la serie es no estacionaria, ya que su media no es constante y la ACF decae de manera muy lenta.Por último, es importante mencionar que el valor mínimo en la pronunciada caída de 2020 no es cero, sino uno, debido a que se le sumó un millón a la variable original total y, al estar expresada en millones (ventas_mill), se tradujo en sumarle 1 a la escala del gráfico.
+
+## 14 Loterías
+
+```{r}
+archivos <- list.files(
+  "Loterias_ajustadas",
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+
+paneles <- list()
+
+for (i in seq_along(archivos)) {
+  
+  nombre <- tools::file_path_sans_ext(basename(archivos[i]))
+  
+  paneles[[nombre]] <- diagnostico_loteria(
+    archivos[i],
+    nombre
+  )
+}
+
+paneles
+```
+
+Todas las loterías presentan tendencia, caracterizada por un crecimiento moderado antes de 2020 y un crecimiento sostenido y más acelerado a partir del periodo 2021-2025.
+
+Respecto a la estacionariedad, ninguna de las series es estacionaria en niveles. En todas las loterías, la ACF muestra un decaimiento lento.
+
+Sobre la estacionalidad, se observan patrones anuales recurrentes con crestas periódicas hacia el cierre de cada año, evidenciados en la ACF mediante picos significativos en los rezagos múltiplos de 12, lo que confirma un componente estacional de periodo doce.
+
+Al comparar las series territoriales con el Total Nacional, se aprecia que comparten la misma estructura macroeconómica. La principal diferencia radica en la varianza: mientras que el Total Nacional suaviza las fluctuaciones por el efecto de la agregación, algunas series de alta concentración de mercado como Medellín, Bogotá, Boyacá o Valle presentan mayor volatilidad y picos de venta atípicos más pronunciados.
+:::
+
+# Paso 2: Transformación
+
+::: panel-tabset
+## Estimación de $\lambda$
+
+```{r}
+# Intervalos: serie nacional y 14 loterías (usa `archivos` definido en el Paso 1)
+res_nac <- data.frame(loteria = "Nacional", t(ic_lambda(serie_nacional$y)))
+
+res_14 <- do.call(rbind, lapply(archivos, function(a) {
+  d <- read.csv(a)
+  d <- d[order(d$anio, d$mes), ]
+  data.frame(loteria = tools::file_path_sans_ext(basename(a)),
+             t(ic_lambda(d$ventas)))
+}))
+
+tabla_ic <- rbind(res_nac, res_14)
+```
+
+```{r}
+# Aplicar el criterio y dejar los objetos que usa la transformación
+tabla_ic$lambda_final <- mapply(aplicar_criterio,
+                                tabla_ic$lambda, tabla_ic$inf, tabla_ic$sup)
+
+tabla_ic$transformacion <- ifelse(tabla_ic$lambda_final == 1, "Ninguna",
+                           ifelse(tabla_ic$lambda_final == 0.5, "Raíz cuadrada",
+                           ifelse(tabla_ic$lambda_final == 0, "Logaritmo",
+                                  "Box-Cox con lambda estimado")))
+
+lambda_nacional   <- tabla_ic$lambda_final[tabla_ic$loteria == "Nacional"]
+resultados_lambda <- data.frame(loteria = tabla_ic$loteria,
+                                lambda  = tabla_ic$lambda_final)
+
+knitr::kable(tabla_ic[, c("loteria", "lambda", "inf", "sup", "transformacion")],
+             row.names = FALSE, digits = 2,
+             col.names = c("Serie", "λ̂", "Límite inf.", "Límite sup.", "Transformación"))
+```
+
+En 7 series el intervalo de confianza al 95 % contiene λ = 0 y se aplica el logaritmo; en las 8 restantes el intervalo queda en valores negativos sin incluir 0, 0,5 ni 1, y se usa λ̂. Ninguna serie requiere raíz cuadrada ni permanece sin transformar.
+
+```{r}
+lambda_guerrero <- function(y) {
+  BoxCox.lambda(ts(y, frequency = 12), method = "guerrero")
+}
+
+g_nac <- lambda_guerrero(serie_nacional$y)
+
+g_14 <- sapply(archivos, function(a) {
+  d <- read.csv(a)
+  d <- d[order(d$anio, d$mes), ]
+  lambda_guerrero(d$ventas)
+})
+names(g_14) <- tools::file_path_sans_ext(basename(archivos))
+
+g_todas <- c(Nacional = g_nac, g_14)
+
+comparacion_metodos <- data.frame(
+  loteria  = tabla_ic$loteria,
+  guerrero = round(unname(g_todas[tabla_ic$loteria]), 2),
+  loglik   = tabla_ic$lambda,
+  inf      = tabla_ic$inf,
+  sup      = tabla_ic$sup
+)
+comparacion_metodos$guerrero_dentro <- ifelse(
+  comparacion_metodos$guerrero >= comparacion_metodos$inf &
+  comparacion_metodos$guerrero <= comparacion_metodos$sup, "Sí", "No")
+
+knitr::kable(comparacion_metodos, row.names = FALSE,
+             col.names = c("Serie", "λ Guerrero", "λ loglik",
+                           "Límite inf.", "Límite sup.", "¿Guerrero dentro del IC?"))
+```
+
+Para determinar la transformación más adecuada se consideraron los intervalos de confianza del 95% asociados a la estimación de (\lambda) por máxima verosimilitud. Siguiendo los criterios establecidos, si el intervalo contiene 1 se conserva la serie original; si contiene 0.5 se utiliza la raíz cuadrada; si contiene 0 se emplea el logaritmo natural; y, cuando no contiene ninguno de estos valores, se utiliza la estimación de (\lambda) obtenida por máxima verosimilitud.
+
+En los resultados obtenidos, ninguna de las series presenta un intervalo que contenga 1 o 0.5. Para Medellín, Santander, Cauca, Huila, Quindío y Tolima, los intervalos contienen 0, por lo que se considera adecuada la transformación logarítmica. En las demás series, el intervalo no contiene ninguno de los valores de referencia, por lo que se mantiene la transformación asociada a la estimación de (\lambda) por máxima verosimilitud.
+
+Adicionalmente, se observa que las estimaciones de (\lambda) varían según el método empleado. Esta diferencia se debe a que Guerrero y máxima verosimilitud utilizan criterios distintos para determinar la transformación, por lo que la elección de (\lambda) puede depender del procedimiento utilizado. En este análisis, la estimación de Guerrero se utiliza como referencia para estabilizar la variabilidad, mientras que los intervalos de confianza de máxima verosimilitud permiten complementar la decisión sobre la transformación.
+
+### Transformación Box-Cox
+
+```{r}
+# Serie nacional (la serie que usa el resto del documento)
+serie_nacional_bc <- serie_nacional
+
+serie_nacional_bc$y <- BoxCox(
+  serie_nacional$y,
+  lambda = lambda_nacional
+)
+```
+
+```{r}
+# Nacional en CSV: usa ventas_mill, la misma variable con que se estimó lambda
+datos_nacional <- read.csv("base_filtrada_ajustada.csv")
+
+datos_nacional$ventas_boxcox <- BoxCox(
+  datos_nacional$ventas_mill,
+  lambda = lambda_nacional
+)
+
+write.csv(
+  datos_nacional,
+  "base_nacional_BoxCox.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+# 14 loterías
+dir.create("Loterias_BoxCox", showWarnings = FALSE)
+
+for (archivo in archivos) {
+
+  datos <- read.csv(archivo)
+  datos <- datos[order(datos$anio, datos$mes), ]
+
+  nombre <- tools::file_path_sans_ext(basename(archivo))
+
+  lambda <- resultados_lambda$lambda[resultados_lambda$loteria == nombre]
+  stopifnot(length(lambda) == 1)   # avisa si el nombre no coincide
+
+  datos$ventas_boxcox <- BoxCox(datos$ventas, lambda = lambda)
+
+  write.csv(
+    datos,
+    paste0("Loterias_BoxCox/", nombre, ".csv"),
+    row.names = FALSE
+  )
+}
+```
+
+### Graficas de las series tranformadas
+
+```{r}
+# Preparar las 14 loterías transformadas
+archivos_bc <- list.files(
+  "Loterias_BoxCox",
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+
+df_loterias_bc <- data.frame()
+
+for (archivo in archivos_bc) {
+
+  datos <- read_csv(archivo, show_col_types = FALSE)
+
+  df_loterias_bc <- bind_rows(
+    df_loterias_bc,
+    datos %>%
+      mutate(
+        fecha = as.Date(sprintf("%d-%02d-01", anio, mes)),
+        loteria = str_remove(loteria, "^loteria_de_"),
+        loteria = str_to_title(str_replace_all(loteria, "_", " "))
+      ) %>%
+      select(fecha, loteria, ventas_boxcox)
+  )
+}
+```
+
+```{r}
+#Preparar la serie nacional transformada
+datos_nacional <- read_csv(
+  "base_nacional_BoxCox.csv",
+  show_col_types = FALSE
+)
+
+df_nacional_bc <- datos_nacional %>%
+  mutate(
+    fecha = as.Date(sprintf("%d-%02d-01", anio, mes)),
+    loteria = "Total nacional"
+  ) %>%
+  select(fecha, loteria, ventas_boxcox)
+```
+
+```{r}
+d_ord <- df_loterias_bc %>% arrange(loteria, fecha)
+
+series_14_bc <- lapply(
+  split(d_ord, d_ord$loteria),
+  function(d) data.frame(fecha = d$fecha, y = d$ventas_boxcox)
+)
+
+```
+
+```{r}
+# Unir las 15 series
+df_15_series_bc <- bind_rows(
+  df_loterias_bc,
+  df_nacional_bc
+)
+
+# Generar la matriz gráfica
+p_matriz_bc <- ggplot(
+  df_15_series_bc,
+  aes(x = fecha, y = ventas_boxcox)
+) +
+  geom_line(color = "purple", linewidth = 0.6) +
+  facet_wrap(
+    ~ loteria,
+    scales = "free_y",
+    ncol = 5
+  ) +
+  labs(
+    title = "Series de ventas de lotería después de la transformación Box-Cox",
+    subtitle = "14 loterías territoriales y serie total nacional",
+    x = "Año / Fecha",
+    y = "Ventas transformadas (Box-Cox)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.background = element_rect(fill = "#f0f0f0", color = NA),
+    strip.text = element_text(face = "bold", size = 9),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, color = "gray30"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+print(p_matriz_bc)
+
+```
+
+En las series de ventas transformadas mediante el método Box-Cox se observa, en general, una dispersión más uniforme de las fluctuaciones a lo largo del tiempo, lo que sugiere una estabilización visual de la varianza en la mayoría de las series. Este comportamiento se aprecia especialmente en series como Cundinamarca, Cruz Roja, Cauca, Huila, Quindío, Risaralda, Tolima y Valle, donde las fluctuaciones alrededor de la tendencia presentan una amplitud relativamente similar durante el período.
+
+Sin embargo, en algunas series, como Bogotá, Boyacá, Medellín y Santander, todavía se observan fluctuaciones de mayor magnitud y valores extremos en determinados períodos, por lo que la estabilización no es completamente uniforme. La serie nacional también presenta una variabilidad relativamente controlada después de la transformación, aunque conserva algunos picos.
+
+En general, los resultados gráficos sugieren que la transformación Box-Cox contribuyó a estabilizar la varianza de las series, aunque este efecto no es idéntico en todas las loterías.
+
+## Descomposición STL
+
+```{r}
+# Crear carpeta para guardar las gráficas
+dir.create("STL_BoxCox", showWarnings = FALSE)
+
+# Lista para guardar las descomposiciones
+resultados_stl <- list()
+
+# Nombres de las 15 series
+nombres_series <- unique(df_15_series_bc$loteria)
+
+for (nombre in nombres_series) {
+  
+  # Seleccionar la serie
+  datos <- df_15_series_bc %>%
+    filter(loteria == nombre) %>%
+    arrange(fecha)
+  
+  # Convertir a serie temporal mensual
+  serie <- ts(
+    datos$ventas_boxcox,
+    start = c(
+      as.numeric(format(min(datos$fecha), "%Y")),
+      as.numeric(format(min(datos$fecha), "%m"))
+    ),
+    frequency = 12
+  )
+  
+  # Descomposición STL
+  stl_resultado <- stl(
+    serie,
+    s.window = "periodic"
+  )
+  
+  # Guardar resultado
+  resultados_stl[[nombre]] <- stl_resultado
+  
+  # Crear datos de los componentes
+  componentes <- data.frame(
+    fecha = datos$fecha,
+    Serie = as.numeric(serie),
+    Tendencia = as.numeric(stl_resultado$time.series[, "trend"]),
+    Estacionalidad = as.numeric(stl_resultado$time.series[, "seasonal"]),
+    Residuo = as.numeric(stl_resultado$time.series[, "remainder"])
+  )
+  
+  # Pasar a formato largo y fijar el orden
+  componentes_largos <- componentes %>%
+    tidyr::pivot_longer(
+      cols = -fecha,
+      names_to = "componente",
+      values_to = "valor"
+    ) %>%
+    mutate(
+      componente = factor(
+        componente,
+        levels = c(
+          "Serie",
+          "Tendencia",
+          "Estacionalidad",
+          "Residuo"
+        )
+      )
+    )
+  
+  # Gráfica
+  grafica <- ggplot(
+    componentes_largos,
+    aes(x = fecha, y = valor)
+  ) +
+    geom_line(
+      color = "purple",
+      linewidth = 0.6
+    ) +
+    facet_grid(
+      componente ~ .,
+      scales = "free_y"
+    ) +
+    labs(
+      title = paste("Descomposición STL -", nombre),
+      x = "Fecha",
+      y = "Valor"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      strip.background = element_rect(
+        fill = "#f0f0f0",
+        color = NA
+      ),
+      strip.text = element_text(
+        face = "bold",
+        size = 10
+      ),
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(
+        face = "bold",
+        size = 14,
+        hjust = 0.5
+      ),
+      axis.text.x = element_text(
+        angle = 45,
+        hjust = 1
+      )
+    )
+  
+  # Guardar gráfica
+  ggsave(
+    filename = paste0(
+      "STL_BoxCox/STL_",
+      gsub(" ", "_", nombre),
+      ".png"
+    ),
+    plot = grafica,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+}
+```
+:::
+::::::
+
+# Paso 3: Diferenciación
+
+::: panel-tabset
+A la serie nacional y a cada una de las 14 loterías, transformadas con Box-Cox, se les construyeron tres versiones: la serie original, la serie con una diferencia estacional de orden 12 (D = 1) y la serie con esa diferencia estacional más una diferencia ordinaria (D = 1, d = 1). El propósito fue observar cómo cambian la varianza y la autocorrelación con cada operador de diferenciación.
+
+Para comparar las tres versiones se calcularon la varianza y la autocorrelación en el primer rezago ($\rho_1$). Mientras se quita una raíz unitaria real, la varianza baja y $\rho_1$ se acerca a cero. Cuando se diferencia de más, la varianza vuelve a subir y $\rho_1$ se hace negativo, porque la diferencia introduce una dependencia artificial.
+
+### Serie nacional
+
+```{r}
+y <- serie_nacional_bc$y
+
+# Las tres versiones de la serie
+etapas <- list(
+  "Original"     = y,
+  "D = 1"        = diff(y, lag = 12),
+  "D = 1, d = 1" = diff(diff(y, lag = 12))
+)
+
+# Tabla
+tabla <- data.frame(
+  Etapa    = names(etapas),
+  n        = sapply(etapas, length),
+  Varianza = sapply(etapas, var),
+  rho1     = sapply(etapas, function(x) acf(x, plot = FALSE)$acf[2])
+)
+
+knitr::kable(tabla, row.names = FALSE, digits = c(0, 0, 9, 4),
+             format.args = list(scientific = FALSE))
+```
+
+La tabla compara tres versiones de la serie nacional: la original, la que tiene solo la diferencia estacional (D = 1) y la que tiene además la diferencia ordinaria (D = 1, d = 1). En la serie original la varianza es de unos 14.615 millones y la autocorrelación en el primer rezago ($\rho_1$) es 0,72, un valor alto: cada mes se parece mucho al anterior. Con la diferencia estacional, la varianza baja a cerca de 3.280 millones, una reducción de casi 78 %, mientras que $\rho_1$ se mantiene alta (0,69). Al añadir la diferencia ordinaria, la varianza baja de nuevo, a unos 2.014 millones, y $\rho_1$ pasa a $-0,27$. En las tres versiones la varianza disminuye y $\rho_1$ no llega a valores cercanos a $-0,5$, que es lo que suele observarse cuando se diferencia de más. Esta tabla describe cómo cambia la serie con cada operador; la elección del orden de diferenciación se toma en el Paso 4, con las pruebas de Dickey-Fuller.
+
+### 14 Loterías
+
+```{r}
+#| results: asis
+for (n in names(series_14_bc)) {
+  y <- series_14_bc[[n]]$y
+
+  etapas <- list(
+    "Original"     = y,
+    "D = 1"        = diff(y, lag = 12),
+    "D = 1, d = 1" = diff(diff(y, lag = 12))
+  )
+
+  tabla <- data.frame(
+    Etapa    = names(etapas),
+    n        = sapply(etapas, length),
+    Varianza = sapply(etapas, var),
+    rho1     = sapply(etapas, function(x) acf(x, plot = FALSE)$acf[2])
+  )
+
+  cat("\n\n**", n, "**\n\n", sep = "")
+  print(knitr::kable(tabla, row.names = FALSE, digits = c(0, 0, 15,4),
+                     format.args = list(scientific = FALSE)))
+}
+```
+
+Cada tabla muestra, para una lotería, la varianza y $\rho_1$ de las tres etapas. En toda las loterías la varianza disminuye al diferenciar, pero vuelve a aumentar al agregar la diferencia ordinarioa. Un aumento de la varianza al diferenciar es una señal de que el operador pudo haber introducido variabilidad que la serie no tenía.
+:::
+
+# Paso 4: Raíz Unitaria
+
+::::: panel-tabset
+Para decidir entre las tres versiones se aplicaron las pruebas de Dickey-Fuller (DF) y de Dickey-Fuller aumentada (ADF), cuya hipótesis nula es que la serie tiene raíz unitaria. La ADF incluyó hasta 12 rezagos, elegidos por AIC, para absorber la autocorrelación que deja la estacionalidad. A la serie original se le incluyó constante y tendencia en la regresión de la prueba, y a las diferenciadas solo constante. La raíz unitaria se rechaza cuando el estadístico es menor (más negativo) que el valor crítico al 5 %.
+
+Como DF y ADF solo detectan la raíz unitaria ordinaria y no las estacionales, se complementó con el círculo unitario. Se ajustó un AR(13) a cada versión de la serie, y se graficaron sus raíces inversas. Una raíz sobre el círculo es una raíz unitaria y una raíz dentro corresponde a un proceso estacionario.
+
+## Prueba de Dickey-Fuller y Dickey-Fuller aumentada
+
+::: panel-tabset
+## Serie nacional
+
+```{r}
+# Tres etapas: Original, D=1 y D=1,d=1
+etapas_nac <- crear_etapas(serie_nacional_bc)
+
+
+tabla_nac <- NULL
+for (e in names(etapas_nac)) {
+  tipo <- ifelse(e == "Original", "trend", "drift")
+  fila <- diagnostico_df(etapas_nac[[e]]$y, tipo = tipo)
+  tabla_nac <- rbind(tabla_nac, cbind(Etapa = e, fila))
+}
+
+vista <- tabla_nac
+vista$DF_rechaza  <- ifelse(vista$DF_rechaza,  "Sí", "No")
+vista$ADF_rechaza <- ifelse(vista$ADF_rechaza, "Sí", "No")
+
+knitr::kable(
+  vista[, c("Etapa", "DF_tau", "DF_crit", "DF_rechaza",
+            "ADF_tau", "ADF_crit", "ADF_rezagos", "ADF_rechaza")],
+  col.names = c("Etapa", "DF: estadístico", "DF: crítico 5 %", "DF rechaza",
+                "ADF: estadístico", "ADF: crítico 5 %", "Rezagos ADF", "ADF rechaza"),
+  digits = 2, align = "lrrcrrrc", row.names = FALSE
+)
+```
+
+La tabla presenta las pruebas de Dickey-Fuller (DF) y Dickey-Fuller aumentada (ADF) para las tres versiones de la serie nacional. En todas la hipótesis nula es que la serie tiene raíz unitaria, y se rechaza cuando el estadístico es menor que el valor crítico al 5 %: $-3,43$ para la original, que incluye constante y tendencia, y $-2,88$ para las diferenciadas, que incluyen solo constante. En la serie original las dos pruebas dan resultados distintos: la DF rechaza (estadístico $-13.04$) y la ADF no (estadístico $-1.84$). La DF no incluye rezagos y no corrige la autocorrelación que deja la estacionalidad, por lo que su resultado en una serie mensual estacional es menos confiable, y la conclusión se apoya en la ADF, que usa 12 rezagos. Con la diferencia estacional (D = 1), la ADF rechaza la raíz unitaria (estadístico $-4.75$), y con la diferencia estacional y ordinaria (D = 1, d = 1) también (estadístico $-4.22$).
+
+## 14 Loterías
+
+```{r}
+tabla_14 <- NULL
+for (n in names(series_14_bc)) {
+  etapas <- crear_etapas(series_14_bc[[n]])
+  for (e in names(etapas)) {
+    tipo <- ifelse(e == "Original", "trend", "drift")
+    fila <- diagnostico_df(etapas[[e]]$y, tipo = tipo)
+    tabla_14 <- rbind(tabla_14, cbind(Serie = n, Etapa = e, fila))
+  }
+}
+
+vista14 <- tabla_14
+vista14$DF_rechaza  <- ifelse(vista14$DF_rechaza,  "Sí", "No")
+vista14$ADF_rechaza <- ifelse(vista14$ADF_rechaza, "Sí", "No")
+
+knitr::kable(
+  vista14[, c("Serie", "Etapa", "DF_tau", "DF_crit", "DF_rechaza",
+              "ADF_tau", "ADF_crit", "ADF_rezagos", "ADF_rechaza")],
+  col.names = c("Serie", "Etapa", "DF: estadístico", "DF: crítico 5 %", "DF rechaza",
+                "ADF: estadístico", "ADF: crítico 5 %", "Rezagos ADF", "ADF rechaza"),
+  digits = 2, align = "llrrcrrrc", row.names = FALSE
+)
+```
+
+La tabla presenta las pruebas DF y ADF para las tres versiones de cada una de las 14 loterías. En todas la hipótesis nula es que la serie tiene raíz unitaria, y se rechaza cuando el estadístico es menor que el valor crítico al 5 %. En la serie original, la ADF no rechaza la raíz unitaria en todas las loterías, lo que indica que en nivel no son estacionarias. Con la diferencia estacional (D = 1) la ADF rechaza la raíz unitaria en las 14 loterías, y con la diferencia estacional y ordinaria (D = 1, d = 1) también.
+:::
+
+## Círculo unitario
+
+```{r}
+ang     <- seq(0, 2 * pi, length.out = 200)
+circulo <- data.frame(x = cos(ang), y = sin(ang))
+cruces  <- data.frame(x = cos(2 * pi * (0:11) / 12), y = sin(2 * pi * (0:11) / 12))
+```
+
+::: panel-tabset
+## Serie nacional
+
+```{r}
+#| fig-width: 12
+#| fig-height: 5
+
+# Raíces inversas del polinomio
+raices_nac <- NULL
+for (e in names(etapas_nac)) {
+  phi <- as.numeric(ar.ols(etapas_nac[[e]]$y, aic = FALSE,
+                           order.max = 13, demean = TRUE)$ar)
+  inv <- 1 / polyroot(c(1, -phi))
+  raices_nac <- rbind(raices_nac,
+                      data.frame(Etapa = e, re = Re(inv), im = Im(inv), modulo = Mod(inv)))
+}
+raices_nac$Etapa    <- factor(raices_nac$Etapa, levels = names(etapas_nac))
+raices_nac$Posicion <- ifelse(raices_nac$modulo >= 0.99,
+                              "Cerca o sobre el círculo", "Dentro del círculo")
+
+ggplot(raices_nac, aes(re, im)) +
+  geom_hline(yintercept = 0, color = "grey85") +
+  geom_vline(xintercept = 0, color = "grey85") +
+  geom_path(data = circulo, aes(x, y)) +
+  geom_point(data = cruces, aes(x, y), shape = 4, color = "grey50", size = 2) +
+  geom_point(aes(color = Posicion), size = 2.8) +
+  scale_color_manual(values = c("Dentro del círculo" = "purple4",
+                                "Cerca o sobre el círculo" = "plum3")) +
+  facet_wrap(~ Etapa, ncol = 3) +
+  coord_fixed() +
+  labs(title = "Raíces inversas del polinomio auxiliar AR(13) — Total nacional",
+       x = "Parte real", y = "Parte imaginaria", color = NULL,
+       caption = "× = raíces unitarias de (1 - B^12); la de la derecha, (1,0), es la ordinaria") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+La figura presenta las raíces inversas del polinomio de la serie nacional en sus tres versiones. El círculo de radio 1 es la frontera de la estacionariedad: una raíz sobre el círculo corresponde a un efecto que no se desvanece, y una raíz dentro corresponde a un efecto que se va extinguiendo. En la serie original, tres de las raíces caen exactamente sobre el círculo. Las demás queda dentro. Esto significa que, sin diferenciar, un choque sobre las ventas no se extingue y la serie no regresa a un nivel estable. Con la diferencia estacional (D = 1), las raíces pasan al interior del círculo y ninguna ocupa las posiciones de las cruces. Algunas quedan relativamente cerca del borde, pero ninguna lo toca. Al añadir la diferencia ordinaria (D = 1, d = 1), las raíces siguen dentro del círculo. Por tanto, el círculo coincide con lo que indica la ADF: la diferencia estacional basta para para llevar las raíces al interior del círculo, y la diferencia ordinaria no aporta un cambio que la justifique.
+
+## 14 Loterías
+
+```{r}
+#| fig-width: 12
+#| fig-height: 5
+
+# Un gráfico por lotería, con las tres etapas
+for (n in names(series_14_bc)) {
+  etapas <- crear_etapas(series_14_bc[[n]])
+
+  raices <- NULL
+  for (e in names(etapas)) {
+    phi <- as.numeric(ar.ols(etapas[[e]]$y, aic = FALSE,
+                             order.max = 13, demean = TRUE)$ar)
+    inv <- 1 / polyroot(c(1, -phi))
+    raices <- rbind(raices,
+                    data.frame(Etapa = e, re = Re(inv), im = Im(inv), modulo = Mod(inv)))
+  }
+  raices$Etapa    <- factor(raices$Etapa, levels = names(etapas))
+  raices$Posicion <- ifelse(raices$modulo >= 0.99,
+                            "Cerca o sobre el círculo", "Dentro del círculo")
+
+  print(
+    ggplot(raices, aes(re, im)) +
+      geom_hline(yintercept = 0, color = "grey85") +
+      geom_vline(xintercept = 0, color = "grey85") +
+      geom_path(data = circulo, aes(x, y)) +
+      geom_point(data = cruces, aes(x, y), shape = 4, color = "grey50", size = 2) +
+      geom_point(aes(color = Posicion), size = 2.8) +
+      scale_color_manual(values = c("Dentro del círculo" = "purple4",
+                                    "Cerca o sobre el círculo" = "plum3")) +
+      facet_wrap(~ Etapa, ncol = 3) +
+      coord_fixed() +
+      labs(title = paste("Raíces inversas del polinomio auxiliar AR(13) —", n),
+           x = "Parte real", y = "Parte imaginaria", color = NULL) +
+      theme_minimal(base_size = 11) +
+      theme(legend.position = "bottom")
+  )
+}
+```
+
+Las figuras muestran, para cada lotería, las raíces inversas del polinomio en las tres versiones de la serie. En la serie original, todas las loterías tienen una raíz en el borde. Al diferenciar, todas pasan a estar dentro del círculo unitario; esta conclusión confirma los resultados de la prueba ADF
+:::
+:::::
+
+# Paso 5: Volver a graficar
+
+## Decisión
+
+```{r}
+
+etapa <- c(
+  "Total nacional"          = "D=1",
+  "Loteria De Bogota"       = "D=1",
+  "Loteria De Boyaca"       = "D=1",
+  "Loteria De La Cruz Roja" = "D=1",
+  "Loteria Del Tolima"      = "D=1",
+  "Loteria Del Huila"       = "D=1",
+  "Loteria Del Cauca"       = "D=1",
+  "Loteria Del Valle"       = "D=1",
+  "Loteria De Cundinamarca" = "D=1",
+  "Loteria De Manizales"    = "D=1",
+  "Loteria De Medellin"     = "D=1",
+  "Loteria De Santander"    = "D=1",
+  "Loteria Del Meta"        = "D=1",
+  "Loteria Del Quindio"     = "D=1",
+  "Loteria Del Risaralda"   = "D=1"
+  
+)
+
+knitr::kable(data.frame(Serie = names(etapa), `Etapa elegida` = etapa,
+                        check.names = FALSE),
+             row.names = FALSE, align = "ll")
+```
+
+```{r}
+# Series con la diferenciación escrita arriba
+series_15 <- c(list("Total nacional" = serie_nacional_bc), series_14_bc)
+series_15 <- series_15[names(etapa)]    
+
+D <- ifelse(etapa == "Original", 0, 1)
+d <- ifelse(etapa == "D=1, d=1", 1, 0)
+
+series_15_final <- Map(diferenciar_serie, series_15, D, d)
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 8
+
+df_final <- bind_rows(lapply(names(series_15_final), function(n) {
+  data.frame(fecha = series_15_final[[n]]$fecha,
+             serie = paste0(n, " (", etapa[n], ")"),   
+             es_original = etapa[n] == "Original",
+             valor = series_15_final[[n]]$y)
+}))
+
+# Línea en 0 solo para las series diferenciadas
+ceros <- unique(df_final[!df_final$es_original, "serie", drop = FALSE])
+
+ggplot(df_final, aes(x = fecha, y = valor)) +
+  geom_line(color = "purple", linewidth = 0.6) +
+  geom_hline(data = ceros, aes(yintercept = 0),
+             color = "grey60", linetype = "dashed") +
+  facet_wrap(~ serie, scales = "free_y", ncol = 4) +
+  labs(
+    title = "Series de ventas de lotería con la etapa elegida",
+    subtitle = "Total nacional y 14 loterías territoriales",
+    x = "Año / Fecha", y = "Valor de la serie (Box-Cox)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.background = element_rect(fill = "#f0f0f0", color = NA),
+    strip.text = element_text(face = "bold", size = 8),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, color = "gray30")
+  )
+```
+
+```{r}
+paneles_finales <- list()
+
+for (n in names(series_15_final)) {
+
+  titulo <- paste0(n, " (", etapa[[n]], ")")
+
+  g_serie <- graficar_serie(series_15_final[[n]], titulo)
+
+  cor_final <- graficar_correlaciones(series_15_final[[n]]$y, m = 24)
+
+  paneles_finales[[n]] <- panel_diagnostico(g_serie, cor_final)
+}
+
+paneles_finales
+```
+
+La Figura reúne las series diferenciadas según el orden elegido para cada una. En todas desaparecen la tendencia y los picos estacionales, y los valores oscilan alrededor de un nivel estable.
+
+:::
