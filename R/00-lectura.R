@@ -51,3 +51,35 @@ leer_serie <- function(x, fuente, unidad, variable = "ventas_mill") {
   
   return(resultado)
 }
+
+dividir_datos <- function(obs, r = 25, h_max = 6) {
+  obs <- obs |>
+    tibble::as_tibble() |>
+    dplyr::arrange(fecha) |>
+    tsibble::as_tsibble(index = fecha)
+  N <- nrow(obs)
+  
+  # Primer origen: deja r orígenes y h_max meses por pronosticar al final.
+  # Con N = 174, r = 25 y h_max = 6 da t1 = 144 (diciembre de 2023).
+  t1 <- N - (r - 1) - h_max
+  stopifnot(t1 > 36)
+  
+  list(
+    serie        = obs,
+    entren       = dplyr::slice_head(obs, n = t1),   # para decidir: λ, d, D, modelo
+    t1           = t1,
+    t1_mes       = obs$fecha[t1],
+    origenes     = t1:(t1 + r - 1),                  # posiciones de los orígenes
+    origenes_mes = obs$fecha[t1:(t1 + r - 1)],
+    h_max        = h_max
+  )
+}
+
+datos_origen <- function(div, k, h) {
+  T_k <- div$origenes[k]
+  list(
+    entren = dplyr::slice_head(div$serie, n = T_k),                    # lo que el modelo puede ver
+    futuro = dplyr::slice(div$serie, (T_k + 1):(T_k + h)),             # meses a pronosticar
+    acumulado_real = sum(div$serie$ventas_mill[(T_k + 1):(T_k + h)])   # A_h(T) observado
+  )
+}
