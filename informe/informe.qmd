@@ -1378,5 +1378,60 @@ paneles_finales
 
 La Figura reúne las series diferenciadas según el orden elegido para cada una. En todas desaparecen la tendencia y los picos estacionales, y los valores oscilan alrededor de un nivel estable.
 
-\:::
 
+# Diagnóstico
+
+## Modelos candidatos
+
+Antes de proponer los modelos se analizaron la ACF y la PACF de la serie nacional transformada con Box-Cox, con una diferencia estacional ($D = 1$) y una diferencia ordinaria ($d = 1$). Estas gráficas muestran qué relación queda entre los cambios mensuales de las ventas y permiten elegir las piezas de cada modelo:
+
+- **Meses recientes (parte regular).** La ACF muestra un único pico negativo fuerte en el rezago 1 (cercano a $-0,50$) y luego se corta de golpe dentro de las bandas, mientras que la PACF disminuye poco a poco en los primeros tres rezagos. Cuando la ACF se corta en el primer rezago y la PACF decae gradualmente, el comportamiento corresponde a una media móvil de orden 1 (`MA(1)`), es decir, que el cambio de un mes se corrige con el error del mes anterior.
+- **Mismo mes de años anteriores (parte estacional).** En la ACF, el rezago 12 ya queda dentro de las bandas de confianza y el rezago 24 apenas toca el borde inferior, mientras que en la PACF aparecen picos alrededor del año (rezagos 11 y 13). Esto indica que la diferencia estacional absorbió gran parte del ciclo anual, aunque conviene probar si un término estacional adicional termina de limpiar esa dependencia.
+- **Sin constante.** A diferencia de la serie con una sola diferencia, al aplicar también la diferencia ordinaria la serie oscila alrededor de cero. Por esta razón, los modelos no incluyen constante ni tendencia determinística.
+- **Picos sueltos.** Algunos rezagos intermedios o lejanos (como el 6, 9, 17 o 23) salen levemente de las bandas. Como es habitual que algunos rezagos crucen el límite por azar o por efectos calendario de los sorteos, no se modelan directamente para evitar complicar innecesariamente los modelos.
+
+Todos los candidatos usan la misma diferenciación ($D = 1, d = 1$) y la misma muestra de entrenamiento, por lo que sus criterios de información (AICc y BIC) son directamente comparables.
+
+### M1: SARIMA(0,1,1)(0,1,1)$_{12}$
+
+**Qué dice el modelo.** El cambio mensual de las ventas se ajusta corrigiendo el error del mes anterior y el error del mismo mes del año pasado.
+
+**Por qué se propone.** Es el modelo clásico (*airline*) y la lectura más directa de las gráficas: el corte abrupto en el rezago 1 de la ACF apunta a una media móvil regular `MA(1)`, mientras que la media móvil estacional `SMA(1)` se encarga de suavizar cualquier residuo del ciclo anual. Es el modelo base de referencia.
+
+**Qué se espera ver.** Que ambos coeficientes sean significativos, que el parámetro `ma1` no quede pegado a $-1$ (lo que indicaría haber diferenciado de más) y que los residuos no conserven autocorrelación.
+
+### M2: SARIMA(0,1,1)(0,1,0)$_{12}$
+
+**Qué dice el modelo.** Mantiene la corrección del error del mes anterior, pero asume que la diferencia estacional ($D = 1$) basta por sí sola para eliminar el efecto anual, sin agregar parámetros estacionales.
+
+**Por qué se propone.** Como en la ACF el pico del rezago 12 ya cae dentro de las bandas de confianza, este modelo permite comprobar si el término estacional de M1 es realmente necesario o si basta con una estructura más sencilla.
+
+**Qué se espera ver.** Si el AICc empeora frente a M1 o vuelve a aparecer autocorrelación en el rezago 12 de los residuos, se confirma que el término estacional sí aporta información.
+
+### M3: SARIMA(1,1,1)(0,1,1)$_{12}$
+
+**Qué dice el modelo.** Combina la influencia directa del cambio del mes anterior (`AR(1)`) con la corrección de su error (`MA(1)`), manteniendo el ajuste estacional de M1.
+
+**Por qué se propone.** Aunque la ACF se corta en el rezago 1, añadir un componente autorregresivo permite verificar si existe una inercia de corto plazo que la media móvil por sí sola no logre capturar.
+
+**Qué se espera ver.** Si el término autorregresivo no resulta significativo o el AICc no mejora frente a M1, ese parámetro sobra y se prefiere M1 por parsimonia.
+
+### M4: SARIMA(3,1,0)(0,1,1)$_{12}$
+
+**Qué dice el modelo.** Explica el cambio de las ventas de un mes a partir de los cambios ocurridos en los tres meses anteriores, junto con la corrección estacional de M1.
+
+**Por qué se propone.** Es la alternativa autorregresiva pura: en la PACF se observan tres picos negativos seguidos que van disminuyendo en los rezagos 1, 2 y 3. Sirve para contrastar si la serie se explica mejor mirando tres meses hacia atrás (`AR(3)`) en lugar de usar una media móvil (`MA(1)`).
+
+**Qué se espera ver.** Si obtiene un peor AICc que M1 o alguno de los tres coeficientes autorregresivos no es significativo, se descarta.
+
+### M5: SARIMA(0,1,1)(1,1,0)$_{12}$
+
+**Qué dice el modelo.** Conserva la corrección del error del mes anterior (`MA(1)`), pero modela la relación anual haciendo que el cambio del mes dependa directamente del cambio observado en el mismo mes del año anterior (`SAR(1)`).
+
+**Por qué se propone.** Permite comparar dos formas distintas de representar la estacionalidad: mediante un autorregresivo estacional (M5) frente a una media móvil estacional (M1).
+
+**Qué se espera ver.** Si M5 presenta un AICc más alto que M1, la media móvil estacional describe mejor el comportamiento anual de la serie.
+
+### Qué se hace con los candidatos
+
+Cada modelo se estima por máxima verosimilitud sobre la muestra de entrenamiento. Se comparan sus valores de AICc y BIC, verificando que todos los parámetros sean estadísticamente significativos y que las raíces estén dentro de la región de estacionariedad e invertibilidad. Ante una diferencia de AICc menor que 2, se prefiere el modelo con menos parámetros. El candidato ganador pasa al diagnóstico de residuos para comprobar ruido blanco y normalidad.
