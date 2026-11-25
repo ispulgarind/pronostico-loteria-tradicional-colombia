@@ -25,7 +25,6 @@ library(fabletools)
 library(feasts)
 ```
 
-
 ```{r}
 # Cargar funciones
 source("00-lectura.R")
@@ -1292,24 +1291,22 @@ Las figuras muestran, para cada lotería, las raíces inversas del polinomio en 
 ## Decisión
 
 ```{r}
-
 etapa <- c(
-  "Total nacional"          = "D=1",
-  "Loteria De Bogota"       = "D=1",
-  "Loteria De Boyaca"       = "D=1",
-  "Loteria De La Cruz Roja" = "D=1",
-  "Loteria Del Tolima"      = "D=1",
-  "Loteria Del Huila"       = "D=1",
-  "Loteria Del Cauca"       = "D=1",
-  "Loteria Del Valle"       = "D=1",
-  "Loteria De Cundinamarca" = "D=1",
-  "Loteria De Manizales"    = "D=1",
-  "Loteria De Medellin"     = "D=1",
-  "Loteria De Santander"    = "D=1",
-  "Loteria Del Meta"        = "D=1",
-  "Loteria Del Quindio"     = "D=1",
-  "Loteria Del Risaralda"   = "D=1"
-  
+  "Total nacional"          = "D=1, d=1",
+  "Loteria De Bogota"       = "D=1, d=1",
+  "Loteria De Boyaca"       = "D=1, d=1",
+  "Loteria De La Cruz Roja" = "D=1, d=1",
+  "Loteria Del Tolima"      = "D=1, d=1",
+  "Loteria Del Huila"       = "D=1, d=1",
+  "Loteria Del Cauca"       = "D=1, d=1",
+  "Loteria Del Valle"       = "D=1, d=1",
+  "Loteria De Cundinamarca" = "D=1, d=1",
+  "Loteria De Manizales"    = "D=1, d=1",
+  "Loteria De Medellin"     = "D=1, d=1",
+  "Loteria De Santander"    = "D=1, d=1",
+  "Loteria Del Meta"        = "D=1, d=1",
+  "Loteria Del Quindio"     = "D=1, d=1",
+  "Loteria Del Risaralda"   = "D=1, d=1"
 )
 
 knitr::kable(data.frame(Serie = names(etapa), `Etapa elegida` = etapa,
@@ -1381,4 +1378,5 @@ paneles_finales
 
 La Figura reúne las series diferenciadas según el orden elegido para cada una. En todas desaparecen la tendencia y los picos estacionales, y los valores oscilan alrededor de un nivel estable.
 
-:::
+\:::
+
