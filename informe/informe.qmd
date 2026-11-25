@@ -1435,3 +1435,148 @@ Todos los candidatos usan la misma diferenciación ($D = 1, d = 1$) y la misma m
 ### Qué se hace con los candidatos
 
 Cada modelo se estima por máxima verosimilitud sobre la muestra de entrenamiento. Se comparan sus valores de AICc y BIC, verificando que todos los parámetros sean estadísticamente significativos y que las raíces estén dentro de la región de estacionariedad e invertibilidad. Ante una diferencia de AICc menor que 2, se prefiere el modelo con menos parámetros. El candidato ganador pasa al diagnóstico de residuos para comprobar ruido blanco y normalidad.
+
+
+## Estimación
+
+```{r}
+# Serie nacional SIN transformar como objeto ts mensual (frequency = 12)
+inicio_nac <- c(
+  lubridate::year(min(serie_nacional$fecha)),
+  lubridate::month(min(serie_nacional$fecha))
+)
+
+y_nac <- ts(
+  serie_nacional$y,
+  start = inicio_nac,
+  frequency = 12
+)
+
+# Especificaciones de los 5 modelos candidatos identificados (d = 1, D = 1)
+especificaciones <- data.frame(
+  modelo = c("M1", "M2", "M3", "M4", "M5"),
+  p      = c(   0,    0,    1,    3,    0),
+  q      = c(   1,    1,    1,    0,    1),
+  P      = c(   0,    0,    0,    0,    1),
+  Q      = c(   1,    0,    1,    1,    0)
+)
+
+# Estimar modelos SARIMA(p,1,q)(P,1,Q)[12] sin drift
+fits <- list()
+
+for (i in seq_len(nrow(especificaciones))) {
+  m <- especificaciones[i, ]
+  fits[[m$modelo]] <- tryCatch(
+    Arima(
+      y_nac,
+      order = c(m$p, 1, m$q),
+      seasonal = list(order = c(m$P, 1, m$Q), period = 12),
+      include.drift = FALSE,
+      lambda = lambda_nacional,
+      method = "CSS-ML"
+    ),
+    error = function(e) NULL
+  )
+}
+
+# Quitar modelos que no convergieron
+fits <- fits[!sapply(fits, is.null)]
+```
+
+```{r}
+#| results: asis
+library(knitr)
+
+# Función segura para calcular z evitando sqrt() sobre varianzas <= 0 o NA
+calcular_z <- function(f) {
+  v  <- diag(f$var.coef)
+  ee <- ifelse(is.na(v) | v <= 0, NA_real_, sqrt(v))
+  coef(f) / ee
+}
+
+fmt   <- function(x) formatC(x, format = "g", digits = 3)
+orden <- names(fits)[order(sapply(fits, function(f) f$aicc))]
+
+# Tablas detalladas por modelo
+for (n in orden) {
+  f <- fits[[n]]
+  a <- f$arma
+  b <- coef(f)
+  z <- calcular_z(f)
+
+  tab <- data.frame(
+    Término    = names(b),
+    Estimación = fmt(b),
+    z          = round(z, 2),
+    `Valor p`  = round(2 * pnorm(-abs(z)), 4),
+    check.names = FALSE
+  )
+
+  cat("\n\n**", n, " · SARIMA(", a[1], ",", a[6], ",", a[2], ")(",
+      a[3], ",", a[7], ",", a[4], ")[", a[5], "] · AICc = ",
+      round(f$aicc, 1), "**\n\n", sep = "")
+  cat(kable(tab, row.names = FALSE, align = "lrrr"), sep = "\n")
+}
+```
+
+```{r}
+# Tabla resumen comparativa de criterios
+tabla_criterios <- data.frame(
+  Modelo = names(fits),
+  Especificación = sapply(fits, function(f) {
+    a <- f$arma
+    sprintf("SARIMA(%d,%d,%d)(%d,%d,%d)[%d]",
+            a[1], a[6], a[2], a[3], a[7], a[4], a[5])
+  }),
+  K    = sapply(fits, function(f) length(coef(f))),
+  AICc = sapply(fits, function(f) f$aicc),
+  BIC  = sapply(fits, function(f) f$bic),
+  `Coef. signif.` = sapply(fits, function(f) {
+    z <- calcular_z(f)
+    if (length(z) == 0 || any(is.na(z))) return("Error est. inválido")
+    ifelse(all(abs(z) > 1.96), "Sí", "No")
+  }),
+  check.names = FALSE
+)
+
+tabla_criterios <- tabla_criterios[order(tabla_criterios$AICc), ]
+
+kable(tabla_criterios, row.names = FALSE, digits = 1, align = "llrrrc")
+```
+
+### Holt-winter aditivo
+
+```{r}
+# Holt-Winters aditivo sobre y_nac (ts mensual) con lambda_nacional
+hw_fit <- ets(y_nac, model = "AAA", damped = FALSE, lambda = lambda_nacional)
+
+# Tabla de parámetros de suavizamiento
+tab_hw <- data.frame(
+  Parámetro  = c("α (nivel)", "β (tendencia)", "γ (estacionalidad)"),
+  Estimación = round(hw_fit$par[c("alpha", "beta", "gamma")], 4)
+)
+kable(tab_hw, row.names = FALSE, align = "lr")
+
+# Resumen del ajuste
+kable(data.frame(
+  Modelo = "Holt-Winters aditivo (ETS A,A,A)",
+  K      = length(hw_fit$par),
+  AICc   = hw_fit$aicc,
+  BIC    = hw_fit$bic
+), row.names = FALSE, digits = 1, align = "lrrr")
+```
+
+## Residuos
+
+### M1: SARIMA(0,1,1)(0,1,1)$_{12}$
+
+```{r}
+### M1: SARIMA(0,1,1)(0,1,1)$_{12}$
+
+diag_m1 <- diagnosticar_modelo("M1", fits, serie_nacional)
+diag_m1$panel_res
+diag_m1$g_qq
+kable(diag_m1$tab_jb, row.names = FALSE, digits = 3, align = "lrrrc")
+kable(diag_m1$tab_lb, row.names = FALSE, digits = 3, align = "rrrrc")
+```
+
